@@ -1,318 +1,348 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-import os
-import lpips.lpips_tf as lpips_tf
-import tensorflow as tf
-import utils
-from tensorflow import keras
-from tensorflow.python.keras.models import *
-from tensorflow.python.keras.layers import *
-from stn import spatial_transformer_network as stn_transformer
 
-class StegaStampEncoder(Layer):
-    def __init__(self, height, width):
+
+class StegaStampEncoder(nn.Module):
+    """
+    U-Net encoder that embeds a secret into an image by generating a residual.
+
+    Architecture:
+    - Secret processing: Dense layer + reshape to 50x50x3, then upsample to 400x400x3
+    - Encoder path: 4 downsampling conv blocks (32->32->64->128->256 channels)
+    - Decoder path: 4 upsampling blocks with skip connections (256->128->64->32->32)
+    - Output: 3-channel residual to add to input image
+
+    Input: (secret: [B, 100], image: [B, 3, 400, 400])
+    Output: residual [B, 3, 400, 400]
+    """
+
+    def __init__(self, height=400, width=400):
         super(StegaStampEncoder, self).__init__()
-        self.secret_dense = Dense(7500, activation='relu', kernel_initializer='he_normal')
 
-        self.conv1 = Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')
-        self.conv2 = Conv2D(32, 3, activation='relu', strides=2, padding='same', kernel_initializer='he_normal')
-        self.conv3 = Conv2D(64, 3, activation='relu', strides=2, padding='same', kernel_initializer='he_normal')
-        self.conv4 = Conv2D(128, 3, activation='relu', strides=2, padding='same', kernel_initializer='he_normal')
-        self.conv5 = Conv2D(256, 3, activation='relu', strides=2, padding='same', kernel_initializer='he_normal')
-        self.up6 = Conv2D(128, 2, activation='relu', padding='same', kernel_initializer='he_normal')
-        self.conv6 = Conv2D(128, 3, activation='relu', padding='same', kernel_initializer='he_normal')
-        self.up7 = Conv2D(64, 2, activation='relu', padding='same', kernel_initializer='he_normal')
-        self.conv7 = Conv2D(64, 3, activation='relu', padding='same', kernel_initializer='he_normal')
-        self.up8 = Conv2D(32, 2, activation='relu', padding='same', kernel_initializer='he_normal')
-        self.conv8 = Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')
-        self.up9 = Conv2D(32, 2, activation='relu', padding='same', kernel_initializer='he_normal')
-        self.conv9 = Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')
-        self.conv10 = Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')
-        self.residual = Conv2D(3, 1, activation=None, padding='same', kernel_initializer='he_normal')
+        # Secret processing layer
+        self.secret_dense = nn.Linear(100, 7500)
 
-    def call(self, inputs):
-        secret, image = inputs
-        secret = secret - .5
-        image = image - .5
+        # Encoder path (downsampling)
+        self.conv1 = nn.Conv2d(6, 32, kernel_size=3, padding=1)  # 6 channels: 3 from secret_enlarged + 3 from image
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
+        self.conv4 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+        self.conv5 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)
 
-        secret = self.secret_dense(secret)
-        secret = Reshape((50, 50, 3))(secret)
-        secret_enlarged = UpSampling2D(size=(8,8))(secret)
+        # Decoder path (upsampling with skip connections)
+        # Note: In TensorFlow version, UpSampling2D is used before Conv2D with padding='same'
+        # After upsampling, apply conv with same padding
+        self.up6 = nn.Conv2d(256, 128, kernel_size=2, padding='same')
+        self.conv6 = nn.Conv2d(256, 128, kernel_size=3, padding='same')  # 128 from up6 + 128 from conv4
 
-        inputs = concatenate([secret_enlarged, image], axis=-1)
-        conv1 = self.conv1(inputs)
-        conv2 = self.conv2(conv1)
-        conv3 = self.conv3(conv2)
-        conv4 = self.conv4(conv3)
-        conv5 = self.conv5(conv4)
-        up6 = self.up6(UpSampling2D(size=(2,2))(conv5))
-        merge6 = concatenate([conv4,up6], axis=3)
-        conv6 = self.conv6(merge6)
-        up7 = self.up7(UpSampling2D(size=(2,2))(conv6))
-        merge7 = concatenate([conv3,up7], axis=3)
-        conv7 = self.conv7(merge7)
-        up8 = self.up8(UpSampling2D(size=(2,2))(conv7))
-        merge8 = concatenate([conv2,up8], axis=3)
-        conv8 = self.conv8(merge8)
-        up9 = self.up9(UpSampling2D(size=(2,2))(conv8))
-        merge9 = concatenate([conv1,up9,inputs], axis=3)
-        conv9 = self.conv9(merge9)
-        conva = self.conv9(merge9)
-        conv10 = self.conv10(conv9)
-        residual = self.residual(conv9)
+        self.up7 = nn.Conv2d(128, 64, kernel_size=2, padding='same')
+        self.conv7 = nn.Conv2d(128, 64, kernel_size=3, padding='same')  # 64 from up7 + 64 from conv3
+
+        self.up8 = nn.Conv2d(64, 32, kernel_size=2, padding='same')
+        self.conv8 = nn.Conv2d(64, 32, kernel_size=3, padding='same')  # 32 from up8 + 32 from conv2
+
+        self.up9 = nn.Conv2d(32, 32, kernel_size=2, padding='same')
+        self.conv9 = nn.Conv2d(70, 32, kernel_size=3, padding='same')  # 32 from up9 + 32 from conv1 + 6 from inputs
+
+        self.conv10 = nn.Conv2d(32, 32, kernel_size=3, padding='same')
+
+        # Final residual output (no activation, can be positive or negative)
+        self.residual = nn.Conv2d(32, 3, kernel_size=1, padding='same')
+
+        # Initialize weights with He normal initialization
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, secret, image):
+        """
+        Args:
+            secret: [B, 100] - binary secret bits
+            image: [B, 3, H, W] - input image in range [0, 1]
+
+        Returns:
+            residual: [B, 3, H, W] - residual to add to image
+        """
+        # Center inputs around 0
+        secret = secret - 0.5
+        image = image - 0.5
+
+        # Process secret: dense layer -> reshape -> upsample
+        secret_features = F.relu(self.secret_dense(secret))  # [B, 7500]
+        secret_features = secret_features.view(-1, 3, 50, 50)  # [B, 3, 50, 50] (PyTorch uses NCHW)
+        secret_enlarged = F.interpolate(secret_features, size=(400, 400), mode='nearest')  # [B, 3, 400, 400]
+
+        # Concatenate secret and image
+        inputs = torch.cat([secret_enlarged, image], dim=1)  # [B, 6, 400, 400]
+
+        # Encoder path with skip connections
+        conv1 = F.relu(self.conv1(inputs))  # [B, 32, 400, 400]
+        conv2 = F.relu(self.conv2(conv1))   # [B, 32, 200, 200]
+        conv3 = F.relu(self.conv3(conv2))   # [B, 64, 100, 100]
+        conv4 = F.relu(self.conv4(conv3))   # [B, 128, 50, 50]
+        conv5 = F.relu(self.conv5(conv4))   # [B, 256, 25, 25]
+
+        # Decoder path with skip connections (U-Net style)
+        # Use scale_factor=2 for upsampling, then apply conv, matching TF's UpSampling2D(2,2)
+        up6 = F.relu(self.up6(F.interpolate(conv5, scale_factor=2, mode='nearest')))  # [B, 128, 50, 50]
+        merge6 = torch.cat([conv4, up6], dim=1)  # [B, 256, 50, 50]
+        conv6 = F.relu(self.conv6(merge6))  # [B, 128, 50, 50]
+
+        up7 = F.relu(self.up7(F.interpolate(conv6, scale_factor=2, mode='nearest')))  # [B, 64, 100, 100]
+        merge7 = torch.cat([conv3, up7], dim=1)  # [B, 128, 100, 100]
+        conv7 = F.relu(self.conv7(merge7))  # [B, 64, 100, 100]
+
+        up8 = F.relu(self.up8(F.interpolate(conv7, scale_factor=2, mode='nearest')))  # [B, 32, 200, 200]
+        merge8 = torch.cat([conv2, up8], dim=1)  # [B, 64, 200, 200]
+        conv8 = F.relu(self.conv8(merge8))  # [B, 32, 200, 200]
+
+        up9 = F.relu(self.up9(F.interpolate(conv8, scale_factor=2, mode='nearest')))  # [B, 32, 400, 400]
+        merge9 = torch.cat([conv1, up9, inputs], dim=1)  # [B, 70, 400, 400]
+        conv9 = F.relu(self.conv9(merge9))  # [B, 32, 400, 400]
+
+        conv10 = F.relu(self.conv10(conv9))  # [B, 32, 400, 400]
+
+        # Generate residual (no activation, can be positive or negative)
+        residual = self.residual(conv10)  # [B, 3, 400, 400]
+
         return residual
 
-class StegaStampDecoder(Layer):
-    def __init__(self, secret_size, height, width):
+
+class StegaStampDecoder(nn.Module):
+    """
+    Decoder with Spatial Transformer Network for extracting secret from transformed images.
+
+    Architecture:
+    - STN parameter network: 3 conv layers + dense layer -> 6 affine parameters
+    - STN: applies learned affine transformation to align the image
+    - Decoder network: 5 conv layers + dense layers -> 100-bit secret
+
+    Input: image [B, 3, 400, 400]
+    Output: secret_logits [B, 100] (apply sigmoid to get probabilities)
+    """
+
+    def __init__(self, secret_size=100, height=400, width=400):
         super(StegaStampDecoder, self).__init__()
         self.height = height
         self.width = width
-        self.stn_params = Sequential([
-            Conv2D(32, (3, 3), strides=2, activation='relu', padding='same'),
-            Conv2D(64, (3, 3), strides=2, activation='relu', padding='same'),
-            Conv2D(128, (3, 3), strides=2, activation='relu', padding='same'),
-            Flatten(),
-            Dense(128, activation='relu')
-        ])
-        initial = np.array([[1., 0, 0], [0, 1., 0]])
-        initial = initial.astype('float32').flatten()
+        self.secret_size = secret_size
 
-        self.W_fc1 = tf.Variable(tf.zeros([128, 6]), name='W_fc1')
-        self.b_fc1 = tf.Variable(initial_value=initial, name='b_fc1')
+        # Spatial Transformer Network - parameter estimation
+        self.stn_params = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(128 * 50 * 50, 128),  # After 3 stride-2 convs: 400->200->100->50
+            nn.ReLU(inplace=True)
+        )
 
-        self.decoder = Sequential([
-            Conv2D(32, (3, 3), strides=2, activation='relu', padding='same'),
-            Conv2D(32, (3, 3), activation='relu', padding='same'),
-            Conv2D(64, (3, 3), strides=2, activation='relu', padding='same'),
-            Conv2D(64, (3, 3), activation='relu', padding='same'),
-            Conv2D(64, (3, 3), strides=2, activation='relu', padding='same'),
-            Conv2D(128, (3, 3), strides=2, activation='relu', padding='same'),
-            Conv2D(128, (3, 3), strides=2, activation='relu', padding='same'),
-            Flatten(),
-            Dense(512, activation='relu'),
-            Dense(secret_size)
-        ])
+        # STN affine transformation parameters (initialize to identity)
+        self.fc_loc = nn.Linear(128, 6)
+        # Initialize to identity transformation
+        self.fc_loc.weight.data.zero_()
+        self.fc_loc.bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
 
-    def call(self, image):
-        image = image - .5
-        stn_params = self.stn_params(image)
-        x = tf.matmul(stn_params, self.W_fc1) + self.b_fc1
-        transformed_image = stn_transformer(image, x, [self.height, self.width, 3])
-        return self.decoder(transformed_image)
+        # Decoder network
+        self.decoder = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(128 * 13 * 13, 512),  # After 5 stride-2 convs: 400->200->100->50->25->13
+            nn.ReLU(inplace=True),
+            nn.Linear(512, secret_size)
+        )
 
-class Discriminator(Layer):
+    def stn(self, x):
+        """
+        Spatial Transformer Network
+
+        Args:
+            x: [B, 3, H, W] - input image
+
+        Returns:
+            transformed: [B, 3, H, W] - spatially transformed image
+        """
+        # Get transformation parameters
+        xs = self.stn_params(x)  # [B, 128]
+        theta = self.fc_loc(xs)  # [B, 6]
+        theta = theta.view(-1, 2, 3)  # [B, 2, 3] - affine transformation matrix
+
+        # Generate sampling grid
+        grid = F.affine_grid(theta, x.size(), align_corners=False)
+
+        # Sample from input using grid
+        x_transformed = F.grid_sample(x, grid, align_corners=False)
+
+        return x_transformed
+
+    def forward(self, image):
+        """
+        Args:
+            image: [B, 3, H, W] - input image in range [0, 1]
+
+        Returns:
+            secret_logits: [B, secret_size] - logits for secret bits (apply sigmoid for probabilities)
+        """
+        # Center input around 0
+        image = image - 0.5
+
+        # Apply spatial transformation
+        transformed_image = self.stn(image)
+
+        # Decode secret
+        secret_logits = self.decoder(transformed_image)
+
+        return secret_logits
+
+
+class Discriminator(nn.Module):
+    """
+    WGAN-style discriminator for adversarial training.
+
+    Architecture:
+    - 5 convolutional layers with stride-2 downsampling
+    - Returns both scalar output (mean of feature map) and full heatmap
+
+    Input: image [B, 3, 400, 400]
+    Output: (scalar_output [1], heatmap [B, 1, 25, 25])
+    """
+
     def __init__(self):
         super(Discriminator, self).__init__()
-        self.model = Sequential([
-            Conv2D(8, (3, 3), strides=2, activation='relu', padding='same'),
-            Conv2D(16, (3, 3), strides=2, activation='relu', padding='same'),
-            Conv2D(32, (3, 3), strides=2, activation='relu', padding='same'),
-            Conv2D(64, (3, 3), strides=2, activation='relu', padding='same'),
-            Conv2D(1, (3, 3), activation=None, padding='same')
-        ])
 
-    def call(self, image):
-            x = image - .5
-            x = self.model(x)
-            output = tf.reduce_mean(x)
-            return output, x
+        self.model = nn.Sequential(
+            nn.Conv2d(3, 8, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1)
+        )
 
-def transform_net(encoded_image, args, global_step):
-    sh = tf.shape(encoded_image)
+    def forward(self, image):
+        """
+        Args:
+            image: [B, 3, H, W] - input image in range [0, 1]
 
-    ramp_fn = lambda ramp : tf.minimum(tf.to_float(global_step) / ramp, 1.)
+        Returns:
+            output: scalar - mean of heatmap
+            heatmap: [B, 1, H/16, W/16] - discriminator feature map
+        """
+        # Center input around 0
+        x = image - 0.5
 
-    rnd_bri = ramp_fn(args.rnd_bri_ramp) * args.rnd_bri
-    rnd_hue = ramp_fn(args.rnd_hue_ramp) * args.rnd_hue
-    rnd_brightness = utils.get_rnd_brightness_tf(rnd_bri, rnd_hue, args.batch_size)
+        # Generate heatmap
+        heatmap = self.model(x)  # [B, 1, 25, 25] for 400x400 input
 
-    jpeg_quality = 100. - tf.random.uniform([]) * ramp_fn(args.jpeg_quality_ramp) * (100.-args.jpeg_quality)
-    jpeg_factor = tf.cond(tf.less(jpeg_quality, 50), lambda: 5000. / jpeg_quality, lambda: 200. - jpeg_quality * 2) / 100. + .0001
+        # Compute scalar output as mean
+        output = torch.mean(heatmap)
 
-    rnd_noise = tf.random.uniform([]) * ramp_fn(args.rnd_noise_ramp) * args.rnd_noise
-
-    contrast_low = 1. - (1. - args.contrast_low) * ramp_fn(args.contrast_ramp)
-    contrast_high = 1. + (args.contrast_high - 1.) * ramp_fn(args.contrast_ramp)
-    contrast_params = [contrast_low, contrast_high]
-
-    rnd_sat = tf.random.uniform([]) * ramp_fn(args.rnd_sat_ramp) * args.rnd_sat
-
-    # blur
-    f = utils.random_blur_kernel(probs=[.25,.25], N_blur=7,
-                           sigrange_gauss=[1.,3.], sigrange_line=[.25,1.], wmin_line=3)
-    encoded_image = tf.nn.conv2d(encoded_image, f, [1,1,1,1], padding='SAME')
-
-    noise = tf.random_normal(shape=tf.shape(encoded_image), mean=0.0, stddev=rnd_noise, dtype=tf.float32)
-    encoded_image = encoded_image + noise
-    encoded_image = tf.clip_by_value(encoded_image, 0, 1)
-
-    contrast_scale = tf.random_uniform(shape=[tf.shape(encoded_image)[0]], minval=contrast_params[0], maxval=contrast_params[1])
-    contrast_scale = tf.reshape(contrast_scale, shape=[tf.shape(encoded_image)[0],1,1,1])
-
-    encoded_image = encoded_image * contrast_scale
-    encoded_image = encoded_image + rnd_brightness
-    encoded_image = tf.clip_by_value(encoded_image, 0, 1)
+        return output, heatmap
 
 
-    encoded_image_lum = tf.expand_dims(tf.reduce_sum(encoded_image * tf.constant([.3,.6,.1]), axis=3), 3)
-    encoded_image = (1 - rnd_sat) * encoded_image + rnd_sat * encoded_image_lum
+def get_secret_acc(secret_true, secret_pred):
+    """
+    Calculate bit accuracy and string accuracy for secret recovery.
 
-    encoded_image = tf.reshape(encoded_image, [-1,400,400,3])
-    if not args.no_jpeg:
-        encoded_image = utils.jpeg_compress_decompress(encoded_image, rounding=utils.round_only_at_0, factor=jpeg_factor, downsample_c=True)
+    Args:
+        secret_true: [B, secret_size] - ground truth secret bits
+        secret_pred: [B, secret_size] - predicted secret logits
 
-    summaries = [tf.summary.scalar('transformer/rnd_bri', rnd_bri),
-                 tf.summary.scalar('transformer/rnd_sat', rnd_sat),
-                 tf.summary.scalar('transformer/rnd_hue', rnd_hue),
-                 tf.summary.scalar('transformer/rnd_noise', rnd_noise),
-                 tf.summary.scalar('transformer/contrast_low', contrast_low),
-                 tf.summary.scalar('transformer/contrast_high', contrast_high),
-                 tf.summary.scalar('transformer/jpeg_quality', jpeg_quality)]
+    Returns:
+        bit_acc: scalar - fraction of correctly predicted bits
+        str_acc: scalar - fraction of perfectly recovered secrets (all bits correct)
+    """
+    with torch.no_grad():
+        secret_pred_binary = torch.round(torch.sigmoid(secret_pred))
+        correct_bits = (secret_pred_binary == secret_true).sum(dim=1)  # [B]
 
-    return encoded_image, summaries
+        # String accuracy: fraction of samples with all bits correct
+        total_bits = secret_true.shape[1]
+        str_acc = (correct_bits == total_bits).float().mean()
 
+        # Bit accuracy: fraction of all bits that are correct
+        bit_acc = correct_bits.float().mean() / total_bits
 
-def get_secret_acc(secret_true,secret_pred):
-    with tf.variable_scope("acc"):
-        secret_pred = tf.round(tf.sigmoid(secret_pred))
-        correct_pred = tf.to_int64(tf.shape(secret_pred)[1]) - tf.count_nonzero(secret_pred - secret_true, axis=1)
-
-        str_acc = 1.0 - tf.count_nonzero(correct_pred - tf.to_int64(tf.shape(secret_pred)[1])) / tf.size(correct_pred, out_type=tf.int64)
-
-        bit_acc = tf.reduce_sum(correct_pred) / tf.size(secret_pred, out_type=tf.int64)
         return bit_acc, str_acc
 
-def build_model(encoder,
-                decoder,
-                discriminator,
-                secret_input,
-                image_input,
-                l2_edge_gain,
-                borders,
-                secret_size,
-                M,
-                loss_scales,
-                yuv_scales,
-                args,
-                global_step):
 
-    input_warped = tf.contrib.image.transform(image_input, M[:,1,:], interpolation='BILINEAR')
-    mask_warped = tf.contrib.image.transform(tf.ones_like(input_warped), M[:,1,:], interpolation='BILINEAR')
-    input_warped += (1-mask_warped) * image_input
+if __name__ == '__main__':
+    # Test model shapes
+    print("Testing StegaStamp PyTorch models...")
 
-    residual_warped = encoder((secret_input, input_warped))
-    encoded_warped = residual_warped + input_warped
-    residual = tf.contrib.image.transform(residual_warped, M[:,0,:], interpolation='BILINEAR')
+    batch_size = 4
+    secret = torch.rand(batch_size, 100)
+    image = torch.rand(batch_size, 3, 400, 400)
 
-    if borders == 'no_edge':
-        encoded_image = image_input + residual
-    elif borders == 'black':
-        encoded_image = residual_warped + input_warped
-        encoded_image = tf.contrib.image.transform(encoded_image, M[:,0,:], interpolation='BILINEAR')
-        input_unwarped = tf.contrib.image.transform(input_warped, M[:,0,:], interpolation='BILINEAR')
-    elif borders.startswith('random'):
-        mask = tf.contrib.image.transform(tf.ones_like(residual), M[:,0,:], interpolation='BILINEAR')
-        encoded_image = residual_warped + input_warped
-        encoded_image = tf.contrib.image.transform(encoded_image, M[:,0,:], interpolation='BILINEAR')
-        input_unwarped = tf.contrib.image.transform(input_warped, M[:,0,:], interpolation='BILINEAR')
-        ch = 3 if borders.endswith('rgb') else 1
-        encoded_image += (1-mask) * tf.ones_like(residual) * tf.random.uniform([ch])
-    elif borders == 'white':
-        mask = tf.contrib.image.transform(tf.ones_like(residual), M[:,0,:], interpolation='BILINEAR')
-        encoded_image = residual_warped + input_warped
-        encoded_image = tf.contrib.image.transform(encoded_image, M[:,0,:], interpolation='BILINEAR')
-        input_unwarped = tf.contrib.image.transform(input_warped, M[:,0,:], interpolation='BILINEAR')
-        encoded_image += (1-mask) * tf.ones_like(residual)
-    elif borders == 'image':
-        mask = tf.contrib.image.transform(tf.ones_like(residual), M[:,0,:], interpolation='BILINEAR')
-        encoded_image = residual_warped + input_warped
-        encoded_image = tf.contrib.image.transform(encoded_image, M[:,0,:], interpolation='BILINEAR')
-        encoded_image += (1-mask) * tf.manip.roll(image_input, shift=1, axis=0)
+    # Test Encoder
+    print("\n1. Testing Encoder...")
+    encoder = StegaStampEncoder()
+    residual = encoder(secret, image)
+    print(f"   Input: secret {secret.shape}, image {image.shape}")
+    print(f"   Output: residual {residual.shape}")
+    assert residual.shape == (batch_size, 3, 400, 400), "Encoder output shape mismatch!"
 
-    if borders == 'no_edge':
-        D_output_real, _ = discriminator(image_input)
-        D_output_fake, D_heatmap = discriminator(encoded_image)
-    else:
-        D_output_real, _ = discriminator(input_warped)
-        D_output_fake, D_heatmap = discriminator(encoded_warped)
+    # Test Decoder
+    print("\n2. Testing Decoder...")
+    decoder = StegaStampDecoder()
+    secret_logits = decoder(image)
+    print(f"   Input: image {image.shape}")
+    print(f"   Output: secret_logits {secret_logits.shape}")
+    assert secret_logits.shape == (batch_size, 100), "Decoder output shape mismatch!"
 
-    transformed_image, transform_summaries = transform_net(encoded_image, args, global_step)
+    # Test Discriminator
+    print("\n3. Testing Discriminator...")
+    discriminator = Discriminator()
+    output, heatmap = discriminator(image)
+    print(f"   Input: image {image.shape}")
+    print(f"   Output: scalar {output.item():.4f}, heatmap {heatmap.shape}")
+    assert heatmap.shape[0] == batch_size and heatmap.shape[1] == 1, "Discriminator heatmap shape mismatch!"
 
-    decoded_secret = decoder(transformed_image)
+    # Test accuracy function
+    print("\n4. Testing accuracy calculation...")
+    secret_true = torch.randint(0, 2, (batch_size, 100)).float()
+    secret_pred = torch.randn(batch_size, 100)
+    bit_acc, str_acc = get_secret_acc(secret_true, secret_pred)
+    print(f"   Bit accuracy: {bit_acc:.4f}, String accuracy: {str_acc:.4f}")
 
-    bit_acc, str_acc = get_secret_acc(secret_input, decoded_secret)
+    # Test gradient flow
+    print("\n5. Testing gradient flow...")
+    encoded_image = image + residual
+    secret_recovered = decoder(encoded_image)
+    loss = F.binary_cross_entropy_with_logits(secret_recovered, secret)
+    loss.backward()
+    print(f"   Loss: {loss.item():.4f}")
+    print(f"   Encoder has gradients: {encoder.conv1.weight.grad is not None}")
+    print(f"   Decoder has gradients: {decoder.decoder[0].weight.grad is not None}")
 
-    lpips_loss_op = tf.reduce_mean(lpips_tf.lpips(image_input, encoded_image))
-    secret_loss_op = tf.losses.sigmoid_cross_entropy(secret_input, decoded_secret)
-
-    size = (int(image_input.shape[1]),int(image_input.shape[2]))
-    gain = 10
-    falloff_speed = 4 # Cos dropoff that reaches 0 at distance 1/x into image
-    falloff_im = np.ones(size)
-    for i in range(int(falloff_im.shape[0]/falloff_speed)):
-        falloff_im[-i,:] *= (np.cos(4*np.pi*i/size[0]+np.pi)+1)/2
-        falloff_im[i,:] *= (np.cos(4*np.pi*i/size[0]+np.pi)+1)/2
-    for j in range(int(falloff_im.shape[1]/falloff_speed)):
-        falloff_im[:,-j] *= (np.cos(4*np.pi*j/size[0]+np.pi)+1)/2
-        falloff_im[:,j] *= (np.cos(4*np.pi*j/size[0]+np.pi)+1)/2
-    falloff_im = 1-falloff_im
-    falloff_im = tf.convert_to_tensor(falloff_im, dtype=tf.float32)
-    falloff_im *= l2_edge_gain
-
-    encoded_image_yuv = tf.image.rgb_to_yuv(encoded_image)
-    image_input_yuv = tf.image.rgb_to_yuv(image_input)
-    im_diff = encoded_image_yuv-image_input_yuv
-    im_diff += im_diff * tf.expand_dims(falloff_im, axis=[-1])
-    yuv_loss_op = tf.reduce_mean(tf.square(im_diff), axis=[0,1,2])
-    image_loss_op = tf.tensordot(yuv_loss_op, yuv_scales, axes=1)
-
-    D_loss = D_output_real - D_output_fake
-    G_loss = D_output_fake
-
-    loss_op = loss_scales[0]*image_loss_op + loss_scales[1]*lpips_loss_op + loss_scales[2]*secret_loss_op
-    if not args.no_gan:
-        loss_op += loss_scales[3]*G_loss
-
-    summary_op = tf.summary.merge([
-        tf.summary.scalar('bit_acc', bit_acc, family='train'),
-        tf.summary.scalar('str_acc', str_acc, family='train'),
-        tf.summary.scalar('loss', loss_op, family='train'),
-        tf.summary.scalar('image_loss', image_loss_op, family='train'),
-        tf.summary.scalar('lpip_loss', lpips_loss_op, family='train'),
-        tf.summary.scalar('G_loss', G_loss, family='train'),
-        tf.summary.scalar('secret_loss', secret_loss_op, family='train'),
-        tf.summary.scalar('dis_loss', D_loss, family='train'),
-        tf.summary.scalar('Y_loss', yuv_loss_op[0], family='color_loss'),
-        tf.summary.scalar('U_loss', yuv_loss_op[1], family='color_loss'),
-        tf.summary.scalar('V_loss', yuv_loss_op[2], family='color_loss'),
-    ] + transform_summaries)
-
-    image_summary_op = tf.summary.merge([
-        image_to_summary(image_input, 'image_input', family='input'),
-        image_to_summary(input_warped, 'image_warped', family='input'),
-        image_to_summary(encoded_warped, 'encoded_warped', family='encoded'),
-        image_to_summary(residual_warped+.5, 'residual', family='encoded'),
-        image_to_summary(encoded_image, 'encoded_image', family='encoded'),
-        image_to_summary(transformed_image, 'transformed_image', family='transformed'),
-        image_to_summary(D_heatmap, 'discriminator', family='losses'),
-    ])
-
-    return loss_op, secret_loss_op, D_loss, summary_op, image_summary_op, bit_acc
-
-def image_to_summary(image, name, family='train'):
-    image = tf.clip_by_value(image, 0, 1)
-    image = tf.cast(image * 255, dtype=tf.uint8)
-    summary = tf.summary.image(name,image,max_outputs=1,family=family)
-    return summary
-
-def prepare_deployment_hiding_graph(encoder, secret_input, image_input):
-
-    residual = encoder((secret_input, image_input))
-    encoded_image = residual + image_input
-    encoded_image = tf.clip_by_value(encoded_image, 0, 1)
-
-    return encoded_image, residual
-
-def prepare_deployment_reveal_graph(decoder, image_input):
-    decoded_secret = decoded_secret = decoder(image_input)
-
-    return tf.round(tf.sigmoid(decoded_secret))
+    print("\n✓ All tests passed!")

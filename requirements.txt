@@ -1,5 +1,26 @@
+# PyTorch and related packages
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ONNX export and inference
+onnx>=1.14.0
+onnxruntime>=1.15.0
+
+# Perceptual loss
+lpips>=0.1.4
+
+# TensorBoard for logging
+tensorboard>=2.10.0
+
+# Computer vision and image processing
+opencv-python>=4.5.0
+pillow>=9.0.0
+
+# Numerical computing
+numpy>=1.21.0
+
+# Error correction
 bchlib>=0.7
-opencv-python>=3.4.3.18
-numpy>=1.16.2
-pillow>=5.4.1
-stn>=1.0.1
+
+# Optional: better geometric transformations (can use cv2 instead)
+# kornia>=0.7.0
